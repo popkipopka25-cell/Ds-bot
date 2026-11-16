@@ -1,5 +1,7 @@
-"""Настройки DS Bot. Значения берутся из файла .env (см. .env.example)."""
+"""Настройки DS Bot. Значения берутся из переменных окружения (Render → Environment)
+или, при локальном запуске, из файла .env (см. .env.example)."""
 import os
+import tempfile
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -34,16 +36,32 @@ def _int(name: str):
         return None
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on", "да")
+
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = _int("OWNER_ID")
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "chapapshk1").strip().lstrip("@")
 GROUP_ID = _int("GROUP_ID")  # необязательно: можно привязать группу командой /setgroup
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Kyiv").strip()
 
-DB_PATH = BASE_DIR / os.getenv("DB_FILE", "ds_members.db")
-BACKUP_DIR = BASE_DIR / "backups"
-BACKUP_KEEP = 14                       # сколько резервных копий хранить
-BACKUP_INTERVAL = 24 * 3600            # резервная копия раз в сутки
+# ---------------------------------------------------------------- база данных (Neon PostgreSQL)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
+
+# ---------------------------------------------------------------- веб-сервер для Render / UptimeRobot
+PORT = _int("PORT") or 10000          # Render сам задаёт PORT
+WEB_HOST = "0.0.0.0"
+
+# ---------------------------------------------------------------- резервные копии (JSON-выгрузка)
+# Диск Render временный, поэтому настоящее хранилище — Neon, а копии отправляются владельцу в Telegram.
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "").strip() or (Path(tempfile.gettempdir()) / "ds_backups"))
+BACKUP_KEEP = 14                       # сколько копий держать во временной папке
+BACKUP_INTERVAL = 24 * 3600            # копия раз в сутки
+BACKUP_SEND_TO_OWNER = _bool("BACKUP_SEND_TO_OWNER", True)  # присылать копию владельцу в личку
 
 CHECK_COOLDOWN_SECONDS = 3 * 24 * 3600  # пауза между PvP-проверками: 3 дня
 SYNC_INTERVAL_SECONDS = 6 * 3600        # сверка состава с Telegram и Roblox
@@ -95,8 +113,13 @@ DEFAULT_PERMS = {
 def validate() -> None:
     problems = []
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
-        problems.append("В файле .env не указан BOT_TOKEN (токен от @BotFather).")
+        problems.append("Не указан BOT_TOKEN (токен от @BotFather).")
     if OWNER_ID is None:
-        problems.append("В файле .env не указан OWNER_ID (ваш числовой Telegram ID).")
+        problems.append("Не указан OWNER_ID (ваш числовой Telegram ID).")
+    if not DATABASE_URL:
+        problems.append("Не указан DATABASE_URL (строка подключения Neon PostgreSQL).")
+    elif not DATABASE_URL.startswith(("postgresql://", "postgres://")):
+        problems.append("DATABASE_URL должен начинаться с postgresql:// "
+                        "(вставляйте только саму строку подключения, без слова psql и кавычек).")
     if problems:
         raise SystemExit("Ошибка настройки:\n- " + "\n- ".join(problems))
