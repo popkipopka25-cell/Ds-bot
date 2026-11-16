@@ -16,6 +16,7 @@ import config
 import members_system
 import pvp_system
 import staff_system
+import topics
 from database import db
 from message_manager import lists
 
@@ -109,6 +110,7 @@ async def main() -> None:
     dp.include_router(admin.router)
     dp.include_router(members_system.router)
     dp.include_router(members_system.group_router)
+    dp.include_router(topics.router)
 
     @dp.error()
     async def on_error(event: ErrorEvent):
