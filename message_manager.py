@@ -9,7 +9,7 @@ import hashlib
 import logging
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
 
 import config
 from database import db
@@ -21,6 +21,27 @@ log = logging.getLogger(__name__)
 RANK_CODES = [code for code, *_ in RANKS]
 LIST_KEYS = ["all", *RANK_CODES, "staff", "admins", "checkers"]
 PAGE_LIMIT = 3500  # запас до лимита Telegram в 4096 символов
+
+
+def topic_for(list_key: str):
+    """ID темы форума для списка (None — общая тема / группа без тем).
+
+    Сначала ищется тема именно для этого списка (/settopic ключ), затем общая (/settopic).
+    Значение «0» означает «общая тема (General)».
+    """
+    value = db.get_setting(f"topic:{list_key}")
+    if value is None:
+        value = db.get_setting("topic:default")
+    try:
+        return int(value) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def _forget_topic(list_key: str) -> None:
+    """Тема удалена или недоступна — возвращаем список в общую тему."""
+    name = f"topic:{list_key}" if db.get_setting(f"topic:{list_key}") is not None else "topic:default"
+    db.set_setting(name, "0")
 
 
 def _paginate(title: str, lines: list) -> list:
@@ -152,6 +173,18 @@ class ListManager:
                 await self._sync_key(bot, group_id, key, render(key), force)
         return True
 
+    async def reset(self, bot: Bot, list_keys) -> None:
+        """Удаляет опубликованные сообщения указанных списков; они создадутся заново (в новой теме)."""
+        async with self._lock:
+            for list_key in list_keys:
+                for row in db.messages_with_prefix(f"{list_key}:"):
+                    try:
+                        await bot.delete_message(row["chat_id"], row["message_id"])
+                    except TelegramAPIError:
+                        pass
+                    db.delete_message(row["key"])
+        self.request_refresh()
+
     async def _sync_key(self, bot, chat_id, key, pages, force):
         for i, text in enumerate(pages):
             await self._upsert(bot, chat_id, f"{key}:{i}", text, force)
@@ -183,7 +216,20 @@ class ListManager:
                 if not any(s in message for s in gone):
                     raise
                 log.info("Сообщение %s удалено вручную — создаю заново", key)
-        sent = await self._call(bot.send_message, chat_id=chat_id, text=text, disable_notification=True)
+        list_key = key.split(":")[0]
+        thread_id = topic_for(list_key)
+        params = {"chat_id": chat_id, "text": text, "disable_notification": True}
+        if thread_id:
+            params["message_thread_id"] = thread_id
+        try:
+            sent = await self._call(bot.send_message, **params)
+        except TelegramBadRequest as exc:
+            if not thread_id or "thread not found" not in str(exc).lower():
+                raise
+            log.warning("Тема %s не найдена (удалена?) — публикую список %s в общей теме", thread_id, list_key)
+            _forget_topic(list_key)
+            params.pop("message_thread_id")
+            sent = await self._call(bot.send_message, **params)
         db.set_message(key, chat_id, sent.message_id, digest)
 
     @staticmethod
