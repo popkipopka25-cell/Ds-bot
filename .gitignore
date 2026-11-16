@@ -1,0 +1,5 @@
+.env
+ds_members.db*
+ds_bot.log*
+__pycache__/
+backups/*.db
