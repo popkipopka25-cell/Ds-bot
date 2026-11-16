@@ -1,5 +1,11 @@
 .env
-ds_members.db*
-ds_bot.log*
+*.log
 __pycache__/
-backups/*.db
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+backups/*
+!backups/.gitkeep
+.venv/
+venv/
