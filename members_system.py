@@ -3,14 +3,15 @@ import asyncio
 import logging
 import math
 import sqlite3
+import time
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import (JOIN_TRANSITION, LEAVE_TRANSITION, ChatMemberUpdatedFilter, Command,
-                             CommandObject, CommandStart)
+                             CommandObject, CommandStart, StateFilter)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, ChatMemberUpdated, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, ChatMemberUpdated, Message
 
 import config
 import roblox
@@ -33,7 +34,9 @@ TOP_PAGE = 10
 
 
 class Reg(StatesGroup):
-    nick = State()
+    nick = State()      # ждём Roblox username
+    confirm = State()   # показали карточку, ждём «Да / Нет»
+    verify = State()    # ждём код в описании профиля Roblox
 
 
 class Search(StatesGroup):
@@ -45,7 +48,7 @@ class Violation(StatesGroup):
 
 
 WELCOME = ("🖤 Добро пожаловать в DS!\n\n"
-           "Твой Roblox-ник успешно проверен.\n"
+           "Твой Roblox-аккаунт подтверждён.\n"
            "Ты добавлен в состав клана.\n\n"
            "Теперь ты можешь просматривать свой профиль и PvP-ранг через бота")
 
@@ -69,8 +72,9 @@ async def cmd_start(msg: Message, state: FSMContext):
                                 reply_markup=main_menu_kb(staff) if staff else None)
     intro = "Ты выбыл из состава клана. Чтобы вернуться, " if u else "Привет! Это бот клана <b>DS</b>. Чтобы вступить, "
     await state.set_state(Reg.nick)
-    await msg.answer(f"🖤 <b>DS</b>\n{SEP}\n{intro}отправь свой <b>Roblox-ник</b>.\n"
-                     f"Ник должен заканчиваться на <b>DS</b> (например, ChapaDS).",
+    await msg.answer(f"🖤 <b>DS</b>\n{SEP}\n{intro}отправь свой <b>Roblox username</b> — "
+                     f"ник, которым ты входишь в аккаунт (не Display Name).\n"
+                     f"Пароль от Roblox мне <b>не нужен</b> и присылать его нельзя.",
                      reply_markup=main_menu_kb(True) if staff else None)
 
 
@@ -114,23 +118,80 @@ async def cmd_help(msg: Message):
 
 
 # ------------------------------------------------------------------ регистрация
-@router.message(Reg.nick, F.text, ~F.text.startswith("/"))
+CODE_TTL = 30 * 60        # код живёт 30 минут
+CHECK_PAUSE = 5           # минимум секунд между проверками кода (защита от лимитов Roblox)
+_last_check: dict = {}
+
+
+async def _say(cb: CallbackQuery, text: str, markup=None) -> None:
+    """Новое сообщение в ответ на кнопку (cb.answer вызывается отдельно, ровно один раз)."""
+    await cb.message.answer(text, reply_markup=markup)
+
+
+def _reg_kb_confirm():
+    return ikb([[("✅ Да, это мой аккаунт", "reg:yes")],
+                [("❌ Нет, это не мой аккаунт", "reg:no")]])
+
+
+def _reg_kb_verify():
+    return ikb([[("🔍 Проверить", "reg:check")],
+                [("🔄 Новый код", "reg:newcode"), ("✖️ Отмена", "reg:cancel")]])
+
+
+def _card_text(info) -> str:
+    return (f"🖤 <b>НАЙДЕН ROBLOX-АККАУНТ</b>\n{SEP}\n"
+            f"Username: <b>{esc(info.name)}</b>\n"
+            f"Display Name: <b>{esc(info.display_name)}</b>\n"
+            f"Roblox User ID: <code>{info.id}</code>\n"
+            f'Профиль: <a href="{info.profile_url}">{info.profile_url}</a>\n\n'
+            f"Это ваш Roblox-аккаунт?")
+
+
+def _verify_text(code: str) -> str:
+    return (f"🔐 <b>ПОДТВЕРЖДЕНИЕ АККАУНТА</b>\n{SEP}\n"
+            f"Нужно убедиться, что аккаунт принадлежит тебе.\n\n"
+            f"1. Открой свой профиль Roblox и нажми «Редактировать» в блоке «Обо мне» (About).\n"
+            f"2. Временно впиши в описание этот код:\n\n<code>{code}</code>\n\n"
+            f"3. Сохрани описание и нажми «🔍 Проверить».\n\n"
+            f"Код действует 30 минут. Пароль от Roblox вводить не нужно. "
+            f"Если Roblox заменил код на «####», нажми «🔄 Новый код».")
+
+
+async def _send_card(msg: Message, info, avatar_url) -> None:
+    """Карточка аккаунта: официальная аватарка Roblox + данные API (без фальшивых скриншотов)."""
+    text, kb = _card_text(info), _reg_kb_confirm()
+    if avatar_url:
+        try:
+            return await msg.answer_photo(avatar_url, caption=text, reply_markup=kb)
+        except TelegramAPIError as exc:
+            log.info("Telegram не принял ссылку на аватарку: %s", exc)
+        data = await roblox.download_image(avatar_url)
+        if data:
+            try:
+                return await msg.answer_photo(BufferedInputFile(data, "avatar.png"),
+                                              caption=text, reply_markup=kb)
+            except TelegramAPIError as exc:
+                log.info("Не удалось отправить аватарку файлом: %s", exc)
+    await msg.answer(text, reply_markup=kb)
+
+
+@router.message(StateFilter(Reg.nick, Reg.confirm, Reg.verify), F.text, ~F.text.startswith("/"))
 async def reg_nick(msg: Message, state: FSMContext, bot: Bot):
-    nick = msg.text.strip()
+    nick = msg.text.strip().lstrip("@")
     tg = msg.from_user
     if not roblox.valid_nick_format(nick):
-        return await msg.answer("❌ Ник должен содержать 3–20 символов: латиница, цифры и «_». "
+        return await msg.answer("❌ Нужен именно <b>username</b> (имя для входа, как в настройках профиля), "
+                                "а не Display Name: 3–20 символов, латиница, цифры и «_», без пробелов. "
                                 "Отправь ник ещё раз.")
     await msg.answer("🔎 Проверяю аккаунт в Roblox…")
     try:
         info = await roblox.get_user_by_name(nick)
     except roblox.RobloxError:
-        return await msg.answer("⚠️ Roblox сейчас недоступен. Попробуй через пару минут — просто отправь ник ещё раз.")
+        return await msg.answer("⚠️ Roblox сейчас недоступен или ограничил запросы. "
+                                "Подожди пару минут и просто отправь ник ещё раз.")
     if info is None:
-        return await msg.answer("❌ Аккаунт с таким ником не найден в Roblox. Проверь написание и отправь ещё раз.")
-    if not roblox.ends_with_ds(info.name):
-        return await msg.answer(f"❌ Ник <b>{esc(info.name)}</b> не подходит: он должен заканчиваться на <b>DS</b> "
-                                f"(например, ChapaDS). Измени ник в Roblox и отправь ещё раз.")
+        return await msg.answer("❌ Аккаунт с таким username не найден в Roblox. "
+                                "Проверь написание и отправь ник ещё раз.")
 
     group_id = db.get_group_id()
     if group_id:
@@ -141,34 +202,150 @@ async def reg_nick(msg: Message, state: FSMContext, bot: Bot):
         except TelegramAPIError as exc:
             log.warning("Не удалось проверить членство в группе: %s", exc)
 
-    by_roblox = db.get_user_by_roblox(info.id)
-    by_tg = db.get_user_by_tg(tg.id)
-    if by_roblox and by_roblox["tg_id"] != tg.id:
-        return await msg.answer("❌ Этот Roblox-аккаунт уже зарегистрирован другим пользователем.")
-    if by_tg and by_tg["roblox_id"] != info.id:
-        return await msg.answer(f"❌ Ты уже зарегистрирован с ником <b>{esc(by_tg['roblox_name'])}</b>. "
-                                f"Для смены аккаунта обратись к администрации.")
-    if by_tg and by_tg["status"] == "active":
-        await state.clear()
-        return await msg.answer("ℹ️ Ты уже в составе клана.", reply_markup=main_menu_kb(is_staff(tg.id)))
-    if by_tg and by_tg["status"] == "removed":
-        await state.clear()
-        return await msg.answer("⛔ Твоя запись удалена администрацией. Обратись к администратору.")
+    problem = _registration_problem(tg.id, info.id)
+    if problem:
+        if problem[1]:
+            await state.clear()
+        return await msg.answer(problem[0], reply_markup=main_menu_kb(is_staff(tg.id)) if problem[1] else None)
 
+    avatar_url = await roblox.get_avatar_url(info.id)
+    await state.set_state(Reg.confirm)
+    await state.update_data(rid=info.id, rname=info.name, rdisplay=info.display_name)
+    await _send_card(msg, info, avatar_url)
+
+
+def _registration_problem(tg_id: int, roblox_id: int):
+    """Возвращает (текст, закончить_диалог) или None, если регистрироваться можно."""
+    by_roblox = db.get_user_by_roblox(roblox_id)
+    by_tg = db.get_user_by_tg(tg_id)
+    if by_roblox and by_roblox["tg_id"] != tg_id:
+        return ("❌ Этот Roblox-аккаунт уже привязан к другому Telegram-аккаунту. "
+                "Повторная регистрация запрещена. Если это твой аккаунт — обратись к администрации.", False)
+    if by_tg and by_tg["roblox_id"] != roblox_id:
+        return (f"❌ Ты уже зарегистрирован с аккаунтом <b>{esc(by_tg['roblox_name'])}</b>. "
+                f"Для смены аккаунта обратись к администрации.", False)
+    if by_tg and by_tg["status"] == "active":
+        return ("ℹ️ Ты уже в составе клана.", True)
+    if by_tg and by_tg["status"] == "removed":
+        return ("⛔ Твоя запись удалена администрацией. Обратись к администратору.", True)
+    return None
+
+
+async def _reg_data(cb: CallbackQuery, state: FSMContext, need: Reg):
+    """Данные диалога регистрации или None, если сессия устарела (например, после перезапуска бота)."""
+    if await state.get_state() != need.state:
+        await cb.answer()
+        await _say(cb, "Сессия регистрации устарела. Нажми /start и отправь ник заново.")
+        return None
+    data = await state.get_data()
+    if not data.get("rid"):
+        await cb.answer()
+        await _say(cb, "Сессия регистрации устарела. Нажми /start и отправь ник заново.")
+        return None
+    return data
+
+
+@router.callback_query(F.data == "reg:no")
+async def reg_no(cb: CallbackQuery, state: FSMContext):
+    if await _reg_data(cb, state, Reg.confirm) is None:
+        return
+    await state.set_state(Reg.nick)
+    await state.update_data(rid=None)
+    await cb.answer()
+    await _say(cb, "Хорошо. Отправь свой Roblox <b>username</b> ещё раз.")
+
+
+@router.callback_query(F.data == "reg:yes")
+async def reg_yes(cb: CallbackQuery, state: FSMContext):
+    data = await _reg_data(cb, state, Reg.confirm)
+    if data is None:
+        return
+    await cb.answer()
+    await _issue_code(cb, state)
+
+
+async def _issue_code(cb: CallbackQuery, state: FSMContext) -> None:
+    code = roblox.generate_code()
+    await state.set_state(Reg.verify)
+    await state.update_data(code=code, code_at=int(time.time()))
+    await _say(cb, _verify_text(code), _reg_kb_verify())
+
+
+@router.callback_query(F.data == "reg:newcode")
+async def reg_newcode(cb: CallbackQuery, state: FSMContext):
+    if await _reg_data(cb, state, Reg.verify) is None:
+        return
+    await cb.answer()
+    await _issue_code(cb, state)
+
+
+@router.callback_query(F.data == "reg:cancel")
+async def reg_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.answer("Регистрация отменена")
+    await _say(cb, "Регистрация отменена. Чтобы начать заново, нажми /start.")
+
+
+@router.callback_query(F.data == "reg:check")
+async def reg_check(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    data = await _reg_data(cb, state, Reg.verify)
+    if data is None:
+        return
+    tg = cb.from_user
+    if time.time() - _last_check.get(tg.id, 0) < CHECK_PAUSE:
+        return await cb.answer("Подожди пару секунд и нажми ещё раз.")
+    _last_check[tg.id] = time.time()
+
+    if int(time.time()) - int(data.get("code_at", 0)) > CODE_TTL:
+        await cb.answer("Код устарел")
+        await _say(cb, "⌛ Срок действия кода истёк. Выдаю новый.")
+        return await _issue_code(cb, state)
+
+    await cb.answer("Проверяю…")
     try:
-        if by_tg:  # восстановление выбывшего участника: ранг и история сохраняются
+        info = await roblox.get_user_by_id(int(data["rid"]))
+    except roblox.RobloxError:
+        return await _say(cb, "⚠️ Roblox сейчас недоступен или ограничил запросы. "
+                              "Подожди минуту и нажми «🔍 Проверить» ещё раз.", _reg_kb_verify())
+    if info is None:
+        await state.clear()
+        return await _say(cb, "❌ Аккаунт больше не найден в Roblox. Нажми /start и начни заново.")
+    if info.is_banned:
+        await state.clear()
+        return await _say(cb, "❌ Этот Roblox-аккаунт заблокирован, подтвердить его невозможно.")
+    if not roblox.code_in_description(data["code"], info.description):
+        return await _say(
+            cb, "❌ Код не найден в описании профиля.\n\n"
+                f"Убедись, что в блоке «Обо мне» есть <code>{data['code']}</code>, описание сохранено "
+                f"и аккаунт — <b>{esc(info.name)}</b>. Иногда Roblox обновляет описание с задержкой "
+                f"в несколько секунд.", _reg_kb_verify())
+
+    # ---- владение подтверждено: только теперь регистрируем
+    problem = _registration_problem(tg.id, info.id)
+    if problem:
+        await state.clear()
+        return await _say(cb, problem[0])
+    by_tg = db.get_user_by_tg(tg.id)
+    try:
+        if by_tg:  # возврат выбывшего участника: ранг и история PvP сохраняются
             db.update_roblox_name(by_tg["id"], info.name, "при повторной регистрации")
+            db.update_roblox_display_name(by_tg["id"], info.display_name)
             db.set_member_status(by_tg["id"], "active", tg.id, actor_name(tg), "Повторная регистрация")
             event = f"♻️ Восстановлен участник <b>{esc(info.name)}</b> ({tg_label(tg.username, tg.full_name)})."
         else:
-            db.create_user(tg.id, tg.username, tg.full_name, info.id, info.name, actor_name(tg))
+            db.create_user(tg.id, tg.username, tg.full_name, info.id, info.name, actor_name(tg),
+                           display_name=info.display_name)
             event = f"➕ Новый участник: <b>{esc(info.name)}</b> ({tg_label(tg.username, tg.full_name)})."
     except sqlite3.IntegrityError:
-        return await msg.answer("❌ Этот аккаунт уже зарегистрирован.")
+        await state.clear()
+        return await _say(cb, "❌ Этот Roblox-аккаунт уже привязан к другому Telegram-аккаунту.")
 
     await state.clear()
     lists.request_refresh()
-    await msg.answer(WELCOME, reply_markup=main_menu_kb(is_staff(tg.id)))
+    await _say(cb, "✅ <b>Аккаунт подтверждён!</b>\n\n"
+                   "Теперь, пожалуйста, <b>удали временный код</b> из описания профиля Roblox — "
+                   "он больше не нужен.")
+    await _say(cb, WELCOME, main_menu_kb(is_staff(tg.id)))
     await notify(bot, "manage_members", event)
 
 
@@ -183,6 +360,7 @@ def profile_text(u, staff_view: bool = False) -> str:
     lines = [
         f"🖤 <b>ПРОФИЛЬ DS</b>\n{SEP}",
         f"Roblox: <b>{esc(u['roblox_name'])}</b>",
+        *([f"Display Name: {esc(u['roblox_display_name'])}"] if u["roblox_display_name"] else []),
         f"Telegram: {tg_label(u['username'], u['full_name'])}",
         f"PvP-ранг: <b>{rank_label(u['rank_code'])}</b>",
         f"Должность: {position}",
@@ -453,17 +631,18 @@ async def on_join(event: ChatMemberUpdated, bot: Bot):
         except TelegramAPIError:
             pass
         return
-    if info is None or not roblox.ends_with_ds(info.name):
+    if info is None:
         await notify(bot, "manage_members",
-                     f"⚠️ <b>{esc(u['roblox_name'])}</b> вернулся в группу, но проверка Roblox не пройдена "
-                     f"(аккаунт недоступен или ник не заканчивается на DS). Запись не восстановлена.")
+                     f"⚠️ <b>{esc(u['roblox_name'])}</b> вернулся в группу, но Roblox-аккаунт не найден "
+                     f"(возможно, удалён). Запись не восстановлена.")
         try:
-            await bot.send_message(tg.id, "❌ Не удалось восстановить запись: ник Roblox должен заканчиваться на DS. "
-                                          "Исправь ник и отправь /start.")
+            await bot.send_message(tg.id, "❌ Не удалось восстановить запись: твой Roblox-аккаунт не найден. "
+                                          "Обратись к администрации.")
         except TelegramAPIError:
             pass
         return
     db.update_roblox_name(u["id"], info.name, "при возвращении в группу")
+    db.update_roblox_display_name(u["id"], info.display_name)
     db.set_member_status(u["id"], "active", None, SYSTEM, "Вернулся в группу, проверка Roblox пройдена")
     lists.request_refresh()
     try:
@@ -526,10 +705,8 @@ async def sync_roblox(bot: Bot) -> None:
         else:
             if db.update_roblox_name(u["id"], info.name, "обнаружено при сверке с Roblox"):
                 lists.request_refresh()
-            if not roblox.ends_with_ds(info.name) and u["id"] not in _warned_roblox:
-                _warned_roblox.add(u["id"])
-                await notify(bot, "manage_members",
-                             f"⚠️ Ник <b>{esc(info.name)}</b> больше не заканчивается на DS.")
+            if db.update_roblox_display_name(u["id"], info.display_name):
+                lists.request_refresh()
         await asyncio.sleep(0.5)
 
 
