@@ -16,8 +16,29 @@ USER_BY_ID_URL = "https://users.roblox.com/v1/users/{}"
 HEADSHOT_URL = "https://thumbnails.roblox.com/v1/users/avatar-headshot"
 PROFILE_URL = "https://www.roblox.com/users/{}/profile"
 
-# Без похожих символов (0/O, 1/I), чтобы код было легко переписать вручную.
-CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+# Код подтверждения — фраза из обычных английских слов. Roblox закрашивает «####»
+# случайные наборы букв и цифр (принимает их за личные данные), а нормальные слова пропускает.
+# Только безобидные слова: природа, еда, предметы, цвета. Без «опасных» слов и цифр.
+CODE_WORDS = [
+    "apple", "river", "stone", "cloud", "forest", "garden", "silver", "golden", "orange", "purple",
+    "yellow", "green", "blue", "white", "brown", "pink", "lemon", "banana", "cherry", "grape",
+    "peach", "melon", "carrot", "potato", "tomato", "bread", "butter", "honey", "sugar", "candy",
+    "cookie", "pizza", "salad", "pepper", "coffee", "water", "milk", "juice", "ocean", "island",
+    "mountain", "valley", "desert", "meadow", "field", "hill", "lake", "pond", "beach", "sand",
+    "wave", "storm", "rain", "snow", "wind", "sun", "moon", "star", "sky", "dawn",
+    "sunset", "rainbow", "thunder", "breeze", "flower", "tulip", "rose", "daisy", "maple", "birch",
+    "willow", "cedar", "bamboo", "grass", "leaf", "branch", "acorn", "moss", "fern", "pebble",
+    "rabbit", "turtle", "dolphin", "panda", "koala", "tiger", "zebra", "horse", "sheep", "duck",
+    "swan", "eagle", "falcon", "robin", "owl", "fox", "bear", "otter", "seal", "whale",
+    "table", "chair", "window", "door", "lamp", "clock", "mirror", "pillow", "blanket", "basket",
+    "bottle", "bucket", "candle", "ladder", "bridge", "castle", "tower", "tunnel", "road", "train",
+    "boat", "kite", "ball", "drum", "piano", "guitar", "violin", "flute", "puzzle", "marble",
+    "ribbon", "button", "pocket", "jacket", "hat", "scarf", "boots", "gloves", "umbrella", "compass",
+    "anchor", "lantern", "feather", "crystal", "diamond", "copper", "iron", "velvet", "cotton", "paper",
+    "pencil", "notebook", "letter", "story", "music", "dance", "smile", "dream", "garden", "harbor",
+]
+CODE_WORDS = sorted(set(CODE_WORDS))
+CODE_LENGTH = 4  # слов в фразе: 150+ слов ^ 4 — это миллиарды комбинаций
 
 
 class RobloxError(Exception):
@@ -46,13 +67,23 @@ def valid_nick_format(nick: str) -> bool:
 
 
 def generate_code() -> str:
-    """Уникальный временный код для описания профиля, например DS-7KM4Q9XB."""
-    return "DS-" + "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
+    """Временная фраза для описания профиля, например: apple river stone cloud."""
+    rng = secrets.SystemRandom()
+    return " ".join(rng.sample(CODE_WORDS, CODE_LENGTH))
+
+
+def _normalize(text: Optional[str]) -> str:
+    """Оставляет только буквы и цифры в нижнем регистре, всё остальное — один пробел.
+    Так фраза находится, даже если человек добавил запятые, переносы строк или лишние пробелы."""
+    return " ".join(re.findall(r"[a-z0-9]+", (text or "").lower()))
 
 
 def code_in_description(code: str, description: Optional[str]) -> bool:
-    """Ищет код в описании профиля (регистр не важен)."""
-    return bool(code) and code.lower() in (description or "").lower()
+    """Ищет фразу целиком (слова подряд) в описании профиля. Регистр и знаки препинания не важны."""
+    wanted = _normalize(code)
+    if not wanted:
+        return False
+    return f" {wanted} " in f" {_normalize(description)} "
 
 
 async def _request(method: str, url: str, **kwargs):
