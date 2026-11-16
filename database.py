@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT,
     full_name TEXT,
     roblox_name TEXT NOT NULL,
+    roblox_display_name TEXT,
     roblox_id INTEGER NOT NULL UNIQUE,
     rank_code TEXT NOT NULL DEFAULT 'DSc' REFERENCES ranks(code),
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'left', 'removed')),
@@ -148,6 +149,13 @@ class Database:
                     "min_wins=excluded.min_wins, max_wins=excluded.max_wins",
                     (code, title, level, low, high),
                 )
+            self._migrate()
+
+    def _migrate(self):
+        """Добавляет новые колонки в уже существующую базу. Старые данные не трогаются."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(users)")}
+        if "roblox_display_name" not in cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN roblox_display_name TEXT")
 
     # ------------------------------------------------------------ низкий уровень
     @contextmanager
@@ -242,17 +250,24 @@ class Database:
     def get_user_by_username(self, username):
         return self.row("SELECT * FROM users WHERE lower(username)=lower(?)", (username,))
 
-    def create_user(self, tg_id, username, full_name, roblox_id, roblox_name, actor_name=None):
+    def create_user(self, tg_id, username, full_name, roblox_id, roblox_name, actor_name=None,
+                    display_name=None):
         with self.tx() as c:
             cur = c.execute(
-                "INSERT INTO users(tg_id, username, full_name, roblox_name, roblox_id, rank_code, "
-                "status, joined_at) VALUES (?,?,?,?,?,?, 'active', ?)",
-                (tg_id, username, full_name, roblox_name, roblox_id, DEFAULT_RANK, now()),
+                "INSERT INTO users(tg_id, username, full_name, roblox_name, roblox_display_name, "
+                "roblox_id, rank_code, status, joined_at) VALUES (?,?,?,?,?,?,?, 'active', ?)",
+                (tg_id, username, full_name, roblox_name, display_name, roblox_id, DEFAULT_RANK, now()),
             )
             uid = cur.lastrowid
             self._log(c, tg_id, actor_name or username or full_name, "member_add",
-                      f"Roblox: {roblox_name} (ID {roblox_id})", uid)
+                      f"Roblox: {roblox_name} (ID {roblox_id}), владение подтверждено кодом", uid)
         return uid
+
+    def update_roblox_display_name(self, user_id, display_name):
+        """Тихо обновляет Display Name (он может меняться чаще, чем username)."""
+        return self.run("UPDATE users SET roblox_display_name=? WHERE id=? "
+                        "AND COALESCE(roblox_display_name, '') != ?",
+                        (display_name, user_id, display_name or "")) > 0
 
     def update_roblox_name(self, user_id, new_name, details=""):
         with self.tx() as c:
@@ -417,158 +432,4 @@ class Database:
         return rid
 
     _REQUEST_SQL = ("SELECT r.*, u.tg_id AS user_tg, u.username AS user_username, "
-                    "u.roblox_name, u.rank_code, u.last_pvp_at, u.status AS user_status "
-                    "FROM rank_requests r JOIN users u ON u.id = r.user_id ")
-
-    def get_request(self, rid):
-        return self.row(self._REQUEST_SQL + "WHERE r.id=?", (rid,))
-
-    def user_open_request(self, user_id):
-        return self.row(self._REQUEST_SQL +
-                        "WHERE r.user_id=? AND r.status IN ('pending','accepted')", (user_id,))
-
-    def pending_requests(self):
-        return self.rows(self._REQUEST_SQL + "WHERE r.status='pending' ORDER BY r.id")
-
-    def accepted_requests(self, by_tg=None):
-        if by_tg is None:
-            return self.rows(self._REQUEST_SQL + "WHERE r.status='accepted' ORDER BY r.id")
-        return self.rows(self._REQUEST_SQL + "WHERE r.status='accepted' AND r.accepted_by=? ORDER BY r.id",
-                         (by_tg,))
-
-    def accept_request(self, rid, checker_tg, checker_name):
-        with self.tx() as c:
-            r = c.execute(self._REQUEST_SQL + "WHERE r.id=?", (rid,)).fetchone()
-            if not r:
-                raise ValueError("Заявка не найдена.")
-            if r["user_tg"] == checker_tg:
-                raise ValueError("Нельзя проверять самого себя.")
-            cur = c.execute("UPDATE rank_requests SET status='accepted', accepted_by=?, accepted_at=? "
-                            "WHERE id=? AND status='pending'", (checker_tg, now(), rid))
-            if cur.rowcount != 1:
-                raise ValueError("Заявка уже принята другим проверяющим или отменена.")
-            self._log(c, checker_tg, checker_name, "request_accept", f"Заявка #{rid}", r["user_id"])
-        return dict(r)
-
-    def release_request(self, rid, tg_id, actor_name, force=False):
-        with self.tx() as c:
-            r = c.execute("SELECT * FROM rank_requests WHERE id=?", (rid,)).fetchone()
-            if not r:
-                return False
-            sql = ("UPDATE rank_requests SET status='pending', accepted_by=NULL, accepted_at=NULL "
-                   "WHERE id=? AND status='accepted'")
-            params = [rid]
-            if not force:
-                sql += " AND accepted_by=?"
-                params.append(tg_id)
-            cur = c.execute(sql, params)
-            if cur.rowcount != 1:
-                return False
-            self._log(c, tg_id, actor_name, "request_release", f"Заявка #{rid} возвращена в очередь",
-                      r["user_id"])
-        return True
-
-    def cancel_request(self, rid, actor_tg, actor_name, only_user_id=None):
-        with self.tx() as c:
-            r = c.execute(self._REQUEST_SQL + "WHERE r.id=?", (rid,)).fetchone()
-            if not r or r["status"] not in ("pending", "accepted"):
-                return None
-            if only_user_id is not None and r["user_id"] != only_user_id:
-                return None
-            c.execute("UPDATE rank_requests SET status='cancelled', finished_at=? WHERE id=?",
-                      (now(), rid))
-            self._log(c, actor_tg, actor_name, "request_cancel", f"Заявка #{rid} отменена", r["user_id"])
-        return dict(r)
-
-    def complete_pvp(self, request_id, checker_tg, checker_name, checker_wins, user_wins):
-        """Вносит результат матча и автоматически пересчитывает ранг — всё в одной транзакции."""
-        validate_scores(checker_wins, user_wins)
-        with self.tx() as c:
-            r = c.execute(self._REQUEST_SQL + "WHERE r.id=?", (request_id,)).fetchone()
-            if not r or r["status"] != "accepted":
-                raise ValueError("Заявка не принята или уже обработана.")
-            if r["accepted_by"] != checker_tg and checker_tg != config.OWNER_ID:
-                raise PermissionError("Эту заявку принял другой проверяющий.")
-            if r["user_status"] != "active":
-                raise ValueError("Участник больше не состоит в клане.")
-            old_rank = r["rank_code"]
-            new_rank, change = evaluate(old_rank, user_wins)
-            ts = now()
-            next_check = ts + config.CHECK_COOLDOWN_SECONDS
-            cur = c.execute("UPDATE rank_requests SET status='done', finished_at=? "
-                            "WHERE id=? AND status='accepted'", (ts, request_id))
-            if cur.rowcount != 1:
-                raise ValueError("Заявка уже обработана.")
-            try:
-                c.execute("INSERT INTO pvp_matches(request_id, user_id, checker_tg_id, checker_wins, "
-                          "user_wins, old_rank, new_rank, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                          (request_id, r["user_id"], checker_tg, checker_wins, user_wins,
-                           old_rank, new_rank, ts))
-            except sqlite3.IntegrityError:
-                raise ValueError("Этот матч уже зарегистрирован.")
-            c.execute("UPDATE users SET rank_code=?, last_pvp_at=?, next_check_at=?, "
-                      "pvp_count=pvp_count+1, last_wins=? WHERE id=?",
-                      (new_rank, ts, next_check, user_wins, r["user_id"]))
-            self._log(c, checker_tg, checker_name, "pvp",
-                      f"Заявка #{request_id}: проверяющий {checker_wins} — участник {user_wins}",
-                      r["user_id"])
-            if new_rank != old_rank:
-                self._log(c, checker_tg, checker_name, "rank_change", f"{old_rank} → {new_rank}",
-                          r["user_id"])
-        return {"user_id": r["user_id"], "user_tg": r["user_tg"], "old_rank": old_rank,
-                "new_rank": new_rank, "change": change, "next_check_at": next_check}
-
-    # ------------------------------------------------------------ статистика
-    def stats(self):
-        def one(sql, params=()):
-            return self.row(sql, params)[0]
-        return {
-            "total": one("SELECT COUNT(*) FROM users"),
-            "active": one("SELECT COUNT(*) FROM users WHERE status='active'"),
-            "inactive": one("SELECT COUNT(*) FROM users WHERE status!='active'"),
-            "ranks": {r["code"]: r["n"] for r in self.rows(
-                "SELECT r.code, (SELECT COUNT(*) FROM users u WHERE u.rank_code=r.code "
-                "AND u.status='active') AS n FROM ranks r")},
-            "staff": one("SELECT COUNT(*) FROM staff"),
-            "checkers": one("SELECT COUNT(DISTINCT staff_id) FROM permissions WHERE permission='pvp_result'"),
-            "pvp": one("SELECT COUNT(*) FROM pvp_matches"),
-            "requests": one("SELECT COUNT(*) FROM rank_requests"),
-            "pending": one("SELECT COUNT(*) FROM rank_requests WHERE status IN ('pending','accepted')"),
-        }
-
-    # ------------------------------------------------------------ опубликованные сообщения
-    def get_message(self, key):
-        return self.row("SELECT * FROM messages WHERE key=?", (key,))
-
-    def set_message(self, key, chat_id, message_id, text_hash):
-        self.run("INSERT INTO messages(key, chat_id, message_id, text_hash) VALUES (?,?,?,?) "
-                 "ON CONFLICT(key) DO UPDATE SET chat_id=excluded.chat_id, "
-                 "message_id=excluded.message_id, text_hash=excluded.text_hash",
-                 (key, chat_id, message_id, text_hash))
-
-    def delete_message(self, key):
-        self.run("DELETE FROM messages WHERE key=?", (key,))
-
-    def messages_with_prefix(self, prefix):
-        return self.rows("SELECT * FROM messages WHERE key LIKE ?", (prefix + "%",))
-
-    # ------------------------------------------------------------ резервная копия
-    def backup(self):
-        config.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        dest = config.BACKUP_DIR / f"ds_members_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        with self.lock:
-            target = sqlite3.connect(str(dest))
-            try:
-                self.conn.backup(target)
-            finally:
-                target.close()
-        files = sorted(config.BACKUP_DIR.glob("ds_members_*.db"))
-        for old in files[:-config.BACKUP_KEEP]:
-            try:
-                old.unlink()
-            except OSError:
-                pass
-        return dest
-
-
-db = Database(config.DB_PATH)
+                    "u.roblox_name, u.rank_code, u.last_pvp_at
