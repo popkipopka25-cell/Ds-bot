@@ -76,6 +76,7 @@ SCHEMA = [
         username TEXT,
         full_name TEXT,
         roblox_name TEXT NOT NULL,
+        roblox_display_name TEXT,
         roblox_id BIGINT NOT NULL UNIQUE,
         rank_code TEXT NOT NULL DEFAULT 'DSc' REFERENCES ranks(code),
         status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'left', 'removed')),
@@ -86,6 +87,8 @@ SCHEMA = [
         last_wins INTEGER,
         left_at BIGINT
     )""",
+    # таблица users могла быть создана раньше без этой колонки — добавляем её на лету
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS roblox_display_name TEXT",
     """CREATE TABLE IF NOT EXISTS staff (
         id BIGSERIAL PRIMARY KEY,
         tg_id BIGINT UNIQUE,
@@ -339,13 +342,15 @@ class Database:
     def get_user_by_username(self, username):
         return self.row("SELECT * FROM users WHERE lower(username)=lower(%s)", (username,))
 
-    def create_user(self, tg_id, username, full_name, roblox_id, roblox_name, actor_name=None):
+    def create_user(self, tg_id, username, full_name, roblox_id, roblox_name, actor_name=None,
+                    display_name=None):
         try:
             with self.tx() as c:
                 cur = c.execute(
-                    "INSERT INTO users(tg_id, username, full_name, roblox_name, roblox_id, rank_code, "
-                    "status, joined_at) VALUES (%s,%s,%s,%s,%s,%s, 'active', %s) RETURNING id",
-                    (tg_id, username, full_name, roblox_name, roblox_id, DEFAULT_RANK, now()),
+                    "INSERT INTO users(tg_id, username, full_name, roblox_name, roblox_display_name, "
+                    "roblox_id, rank_code, status, joined_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s, 'active', %s) RETURNING id",
+                    (tg_id, username, full_name, roblox_name, display_name, roblox_id, DEFAULT_RANK, now()),
                 )
                 uid = cur.fetchone()["id"]
                 self._log(c, tg_id, actor_name or username or full_name, "member_add",
@@ -363,6 +368,13 @@ class Database:
             self._log(c, None, SYSTEM, "roblox_rename",
                       f"{old['roblox_name']} → {new_name}. {details}".strip(), user_id)
         return True
+
+    def update_roblox_display_name(self, user_id, display_name):
+        """Обновляет Display Name из Roblox. True — если значение изменилось."""
+        return self.run(
+            "UPDATE users SET roblox_display_name=%s WHERE id=%s "
+            "AND roblox_display_name IS DISTINCT FROM %s",
+            (display_name, user_id, display_name)) > 0
 
     def set_member_status(self, user_id, status, actor_tg=None, actor_name=None, reason=""):
         """status: 'active' (восстановление), 'left' (вышел из группы) или 'removed' (исключён).
